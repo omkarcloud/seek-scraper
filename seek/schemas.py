@@ -19,6 +19,15 @@ from seek import refdata, refs
 from seek.jobs import MAX_BATCH
 
 
+def _max_length(n):
+    """validate.Length(max=n) that tolerates the None StrippedString returns
+    for an empty value (marshmallow runs validators on it; len(None) is a 500)."""
+    def check(value):
+        if value is not None and len(value) > n:
+            raise ValidationError(f"Longer than maximum length {n}.")
+    return check
+
+
 class CountryField(RefField):
     """The Seek market: AU (default) or NZ, a name, or a Seek link."""
     resolver = staticmethod(refs.resolve_country)
@@ -133,7 +142,7 @@ class AdvertiserField(StrippedString):
 # ---- jobs ----------------------------------------------------------------------------------------------------
 
 class _JobListing(BaseSchema):
-    query = StrippedString(required=False, load_default=None, validate=validate.Length(max=200))
+    query = StrippedString(required=False, load_default=None, validate=_max_length(200))
     country = CountryField()
     page = PageField(max_page=refdata.MAX_RESULTS)
     page_size = PageSizeField(default=20, max_size=refdata.MAX_PAGE_SIZE)
