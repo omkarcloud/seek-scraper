@@ -1,0 +1,10 @@
+services:
+  seek-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — Seek's APIs answer plain HTTP, so leave this unset.
+      # - SEEK_PROXY=http://user:pass@host:port
