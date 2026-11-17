@@ -42,6 +42,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   SeekNotFound       no such job / company / role / page              — never retried
 """
 import json
+import fastjson
 import os
 import re
 import sys
@@ -49,14 +50,17 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from seek import refdata
+from scraper_utils import debug, fanout, memo, sessions
+from scraper_utils.pages import is_challenged
 
 SEARCH_PATH = "/api/jobsearch/v5/search"
 GRAPHQL_PATH = "/graphql"
@@ -64,9 +68,10 @@ CAREER_GRAPHQL_URL = "https://career-guide-api.cloud.seek.com.au/graphql"
 IMPERSONATE = "chrome"
 TIMEOUT = (10, 40)            # (connect, read)
 
-JSON_HEADERS = {"accept": "application/json, text/plain, */*", "accept-language": "en-AU,en;q=0.9"}
-PAGE_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-AU,en;q=0.9"}
+# Accept-Language is set per session from its exit (_session), not here: the
+# pod's own IP says en-US, an AU fallback exit en-AU.
+JSON_HEADERS = {"accept": "application/json, text/plain, */*"}
+PAGE_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 CF_MARKERS = ("just a moment", "challenge-error-text", "cf-chl", "challenge-platform", "attention required")
 
 HYDRATION_RE = re.compile(r'__staticRouterHydrationData\s*=\s*JSON\.parse\("(.*?)"\);\s*</script>', re.S)
@@ -99,14 +104,7 @@ def site(country):
 
 def dump_debug(name, text):
     """Write a raw response to $SEEK_DEBUG_DIR/<name>.txt for post-mortems."""
-    dbg = os.environ.get("SEEK_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("SEEK_DEBUG_DIR", name, text)
 
 
 # ---- curl sessions (per thread, keyed by exit) ---------------------------------------------------
@@ -115,39 +113,16 @@ _local = threading.local()
 
 
 def _sessions():
-    store = getattr(_local, "sessions", None)
-    if store is None:
-        store = _local.sessions = OrderedDict()
-    return store
+    return sessions.thread_store(_local)
 
 
 def _session(key, proxy):
-    from curl_cffi import requests as curl_requests
-    store = _sessions()
-    sess = store.get(key)
-    if sess is None:
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        store[key] = sess
-        while len(store) > 4:
-            _, old = store.popitem(last=False)
-            try:
-                old.close()
-            except Exception:
-                pass
-    else:
-        store.move_to_end(key)
-    return sess
+    return sessions.keyed(_sessions(), key, lambda: sessions.curl_session(
+        IMPERSONATE, proxy, accept_language=egress.accept_language), 4)
 
 
 def _drop_session(key):
-    sess = _sessions().pop(key, None)
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop_keyed(_sessions(), key)
 
 
 def _attempts(label, send):
@@ -175,13 +150,6 @@ def _attempts(label, send):
     raise last
 
 
-def is_challenged(status, headers, text):
-    if (headers or {}).get("cf-mitigated") == "challenge":
-        return True
-    head = (text or "")[:4000].lower()
-    return status in (403, 429, 503) and any(m in head for m in CF_MARKERS)
-
-
 def _classify(resp, label, json_body=True):
     """Raise the failure a response represents, else return its JSON (or text)."""
     status = resp.status_code
@@ -203,7 +171,7 @@ def _classify(resp, label, json_body=True):
     if not json_body:
         return text
     try:
-        return json.loads(text)
+        return fastjson.loads(text)
     except ValueError:
         dump_debug("non_json", text)
         raise SeekUpstreamError(f"non-JSON answer on {label}")
@@ -346,8 +314,8 @@ def hydration_data(html):
         return {}
     raw = match.group(1)
     try:
-        decoded = json.loads(f'"{raw}"')          # the page JS-escapes a JSON string
-        data = json.loads(decoded)
+        decoded = fastjson.loads(f'"{raw}"')          # the page JS-escapes a JSON string
+        data = fastjson.loads(decoded)
     except ValueError:
         return {}
     loader = data.get("loaderData") if isinstance(data, dict) else None
@@ -360,7 +328,7 @@ def apollo_state(html):
     if not match:
         return {}
     try:
-        state = json.loads(match.group(1))
+        state = fastjson.loads(match.group(1))
     except ValueError:
         return {}
     return state if isinstance(state, dict) else {}
@@ -375,19 +343,7 @@ MEMO_MAX = 256
 
 
 def memoized(key, fn, ttl=MEMO_TTL):
-    now = time.monotonic()
-    with _memo_lock:
-        hit = _memo.get(key)
-        if hit and now - hit[0] < ttl:
-            _memo.move_to_end(key)
-            return hit[1]
-    value = fn()
-    with _memo_lock:
-        _memo[key] = (now, value)
-        _memo.move_to_end(key)
-        while len(_memo) > MEMO_MAX:
-            _memo.popitem(last=False)
-    return value
+    return memo.memoized(_memo, _memo_lock, MEMO_MAX, key, fn, ttl)
 
 
 def shared_raw(name, params, build, ttl):
@@ -395,16 +351,25 @@ def shared_raw(name, params, build, ttl):
     the service's response cache (pods share it) when one is installed,
     then build(). Without a `cache` module (the standalone package) it is
     the in-process memo alone."""
-    try:
-        from cache import cached_call
-    except ImportError:
-        cached_call = None
-    seconds = ttl.total_seconds() if hasattr(ttl, "total_seconds") else ttl
-    key = (name, json.dumps(params, sort_keys=True))
-    if cached_call is None:
-        return memoized(key, build, ttl=min(seconds, MEMO_TTL))
-    return memoized(key, lambda: cached_call(f"seek.raw.{name}", params, lambda **_: build(), ttl),
-                    ttl=min(seconds, MEMO_TTL))
+    return memo.shared_raw(memoized, "seek.raw.", MEMO_TTL, name, params, build, ttl)
+
+
+# Long-lived pools (2026-10-23): their threads keep their thread-local curl
+# sessions — and the sticky exits behind them — between requests. The
+# per-call executor they replace opened fresh sessions/exits for every
+# fan-out and threw them away when the call returned. Two levels: a fan-out
+# running inside a fan-out goes to the second pool, so it neither waits on
+# the workers it occupies (deadlock) nor loses its parallelism; a third
+# level runs inline.
+_pools = (ThreadPoolExecutor(max_workers=config.SEEK_BATCH_WORKERS * 4, thread_name_prefix="seek-fanout-0"),
+          ThreadPoolExecutor(max_workers=config.SEEK_BATCH_WORKERS * 4, thread_name_prefix="seek-fanout-1"))
+
+
+def _windowed(fns, workers):
+    """Run `fns` on the pool for this nesting level, at most `workers` at a
+    time; results align with `fns`. The first failure (in `fns` order)
+    propagates once the callables already started have finished."""
+    return fanout.windowed(_pools, "seek-fanout", fns, workers)
 
 
 def run_parallel(fns, workers):
@@ -417,8 +382,7 @@ def run_parallel(fns, workers):
             return ("error", e)
     if not fns:
         return []
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(fns)))) as ex:
-        return list(ex.map(guard, fns))
+    return _windowed([lambda fn=fn: guard(fn) for fn in fns], max(1, workers))
 
 
 if __name__ == "__main__":

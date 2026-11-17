@@ -23,6 +23,7 @@ from math import ceil
 from seek import refdata
 from seek import shared as S
 from seek.shared import as_dict, as_list, g, text
+from scraper_utils.values import bool_or_none as _bool
 
 # ---- small shared pieces ---------------------------------------------------------------------------
 
@@ -92,10 +93,6 @@ def work_type(value, label=None):
     if not tid:
         return {"value": S.lower_snake(raw), "label": text(label) or raw}
     return {"value": ids[tid], "label": text(label) or refdata.WORK_TYPE_LABELS[tid]}
-
-
-def _bool(value):
-    return value if isinstance(value, bool) else None
 
 
 def _location_ref(item):
